@@ -337,41 +337,8 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-function strWidth(s) {
-  let w = 0;
-  for (const ch of String(s)) {
-    const code = ch.codePointAt(0);
-    if (
-      (code >= 0x1100 && code <= 0x115F) ||
-      (code >= 0x2E80 && code <= 0xA4CF) ||
-      (code >= 0xAC00 && code <= 0xD7A3) ||
-      (code >= 0xF900 && code <= 0xFAFF) ||
-      (code >= 0xFE30 && code <= 0xFE4F) ||
-      (code >= 0xFF00 && code <= 0xFF60) ||
-      (code >= 0xFFE0 && code <= 0xFFE6) ||
-      code >= 0x20000
-    ) {
-      w += 2;
-    } else {
-      w += 1;
-    }
-  }
-  return w;
-}
-
-function pad(s, width, align) {
-  const diff = width - strWidth(s);
-  if (diff <= 0) return s;
-  const fill = ' '.repeat(diff);
-  return align === 'left' ? s + fill : fill + s;
-}
-
 function fmtInt(n) {
   return Math.round(n).toLocaleString('ko-KR');
-}
-
-function fmtPrice(n) {
-  return n.toLocaleString('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 async function fetchPrice(code) {
@@ -381,81 +348,7 @@ async function fetchPrice(code) {
   const data = await res.json();
   const d = data?.datas?.[0];
   if (!d) throw new Error(`naver ${code} empty`);
-  return {
-    name: d.stockName,
-    price: Number(String(d.closePrice).replace(/,/g, '')),
-  };
-}
-
-function aggregate(items, prices) {
-  const byCode = new Map();
-  for (const h of items) {
-    const cur = byCode.get(h.code) || { code: h.code, quantity: 0, cost: 0 };
-    cur.quantity += h.quantity;
-    cur.cost += h.quantity * h.avgPrice;
-    byCode.set(h.code, cur);
-  }
-  const rows = [...byCode.values()].map((agg) => {
-    const p = prices.get(agg.code) || {};
-    const currentPrice = p.price ?? 0;
-    const avgPrice = agg.cost / agg.quantity;
-    const marketValue = currentPrice * agg.quantity;
-    const profitLoss = marketValue - agg.cost;
-    return {
-      name: p.name || `(${agg.code})`,
-      quantity: agg.quantity,
-      avgPrice,
-      currentPrice,
-      marketValue,
-      profitLoss,
-      cost: agg.cost,
-    };
-  });
-  const totals = rows.reduce(
-    (acc, r) => {
-      acc.cost += r.cost;
-      acc.marketValue += r.marketValue;
-      acc.profitLoss += r.profitLoss;
-      return acc;
-    },
-    { cost: 0, marketValue: 0, profitLoss: 0 }
-  );
-  return { rows, totals };
-}
-
-const TABLE_HEADERS = ['종목', '수량', '평단', '현재가', '평가금액', '손익', '%'];
-const TABLE_ALIGNS = ['left', 'right', 'right', 'right', 'right', 'right', 'right'];
-
-function rowsForSection(rows, totals, headerLabel) {
-  const body = rows.map((r) => {
-    const rate = r.cost > 0 ? (r.profitLoss / r.cost) * 100 : 0;
-    return [
-      r.name,
-      fmtInt(r.quantity),
-      fmtPrice(r.avgPrice),
-      fmtInt(r.currentPrice),
-      fmtInt(r.marketValue),
-      (r.profitLoss >= 0 ? '+' : '') + fmtInt(r.profitLoss),
-      (rate >= 0 ? '+' : '') + rate.toFixed(2),
-    ];
-  });
-  const totalRate = totals.cost > 0 ? (totals.profitLoss / totals.cost) * 100 : 0;
-  const totalRow = [
-    headerLabel,
-    '',
-    '',
-    '',
-    fmtInt(totals.marketValue),
-    (totals.profitLoss >= 0 ? '+' : '') + fmtInt(totals.profitLoss),
-    (totalRate >= 0 ? '+' : '') + totalRate.toFixed(2),
-  ];
-  return { body, totalRow };
-}
-
-function renderSection(body, totalRow, widths) {
-  const fmtRow = (r) => r.map((cell, i) => pad(cell, widths[i], TABLE_ALIGNS[i])).join('  ');
-  const sep = '─'.repeat(widths.reduce((a, b) => a + b, 0) + (widths.length - 1) * 2);
-  return [fmtRow(TABLE_HEADERS), sep, ...body.map(fmtRow), sep, fmtRow(totalRow)].join('\n');
+  return Number(String(d.closePrice).replace(/,/g, ''));
 }
 
 app.get('/api/assets', async (req, res) => {
@@ -467,54 +360,34 @@ app.get('/api/assets', async (req, res) => {
 
   const uniqueCodes = [...new Set(HOLDINGS.map((h) => h.code))];
   const fetched = await Promise.all(
-    uniqueCodes.map((c) => fetchPrice(c).then((p) => [c, p]).catch((err) => [c, { error: err.message }]))
+    uniqueCodes.map((c) =>
+      fetchPrice(c)
+        .then((price) => [c, { price }])
+        .catch((err) => [c, { error: err.message }])
+    )
   );
   const prices = new Map(fetched);
 
-  const accountOrder = [];
-  const byAccount = new Map();
+  let totalCost = 0;
+  let totalValue = 0;
   for (const h of HOLDINGS) {
-    const acc = h.account || '미분류';
-    if (!byAccount.has(acc)) {
-      accountOrder.push(acc);
-      byAccount.set(acc, []);
-    }
-    byAccount.get(acc).push(h);
+    const p = prices.get(h.code) || {};
+    totalCost += h.quantity * h.avgPrice;
+    totalValue += h.quantity * (p.price ?? 0);
   }
+  const profitLoss = totalValue - totalCost;
+  const rate = totalCost > 0 ? (profitLoss / totalCost) * 100 : 0;
 
-  const overallTotals = { cost: 0, marketValue: 0, profitLoss: 0 };
-  const prepared = [];
-  for (const acc of accountOrder) {
-    const { rows, totals } = aggregate(byAccount.get(acc), prices);
-    const { body, totalRow } = rowsForSection(rows, totals, '소계');
-    prepared.push({ label: acc, body, totalRow });
-    overallTotals.cost += totals.cost;
-    overallTotals.marketValue += totals.marketValue;
-    overallTotals.profitLoss += totals.profitLoss;
-  }
-  const { rows: combinedRows } = aggregate(HOLDINGS, prices);
-  const combined = rowsForSection(combinedRows, overallTotals, '총합');
-  prepared.push({ label: '종목 통합', body: combined.body, totalRow: combined.totalRow });
-
-  const allRows = [
-    TABLE_HEADERS,
-    ...prepared.flatMap((s) => [...s.body, s.totalRow]),
+  const lines = [
+    `총합 : ${fmtInt(totalValue)}원`,
+    `손익 : ${(profitLoss >= 0 ? '+' : '') + fmtInt(profitLoss)}원`,
+    `비율 : ${(rate >= 0 ? '+' : '') + rate.toFixed(2)}%`,
   ];
-  const widths = TABLE_HEADERS.map((_, i) =>
-    Math.max(...allRows.map((r) => strWidth(r[i])))
-  );
-
-  const sections = prepared.map(
-    (s) => `[${s.label}]\n${renderSection(s.body, s.totalRow, widths)}`
-  );
-
-  const errors = [];
   for (const [code, p] of prices) {
-    if (p.error) errors.push(`! ${code}: ${p.error}`);
+    if (p.error) lines.push(`! ${code}: ${p.error}`);
   }
-  if (errors.length) sections.push(errors.join('\n'));
 
-  res.type('text/plain').send('```\n' + sections.join('\n\n') + '\n```');
+  res.type('text/plain').send(lines.join('\n'));
 });
 
 app.listen(PORT, () => console.log('Server running on port ' + PORT));
