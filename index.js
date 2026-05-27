@@ -3,6 +3,14 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const ASSETS_TOKEN = process.env.ASSETS_TOKEN || '';
+let HOLDINGS = [];
+try {
+  HOLDINGS = JSON.parse(process.env.ACCOUNTS_JSON || '{"holdings":[]}').holdings || [];
+} catch (err) {
+  console.error('ACCOUNTS_JSON parse failed:', err.message);
+}
+
 app.use(express.static(path.join(__dirname)));
 
 app.get('/', (req, res) => {
@@ -327,6 +335,171 @@ app.get('/', (req, res) => {
   </script>
 </body>
 </html>`);
+});
+
+function strWidth(s) {
+  let w = 0;
+  for (const ch of String(s)) {
+    const code = ch.codePointAt(0);
+    if (
+      (code >= 0x1100 && code <= 0x115F) ||
+      (code >= 0x2E80 && code <= 0xA4CF) ||
+      (code >= 0xAC00 && code <= 0xD7A3) ||
+      (code >= 0xF900 && code <= 0xFAFF) ||
+      (code >= 0xFE30 && code <= 0xFE4F) ||
+      (code >= 0xFF00 && code <= 0xFF60) ||
+      (code >= 0xFFE0 && code <= 0xFFE6) ||
+      code >= 0x20000
+    ) {
+      w += 2;
+    } else {
+      w += 1;
+    }
+  }
+  return w;
+}
+
+function pad(s, width, align) {
+  const diff = width - strWidth(s);
+  if (diff <= 0) return s;
+  const fill = ' '.repeat(diff);
+  return align === 'left' ? s + fill : fill + s;
+}
+
+function fmtInt(n) {
+  return Math.round(n).toLocaleString('ko-KR');
+}
+
+function fmtPrice(n) {
+  return n.toLocaleString('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+async function fetchPrice(code) {
+  const url = `https://polling.finance.naver.com/api/realtime/domestic/stock/${code}`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  if (!res.ok) throw new Error(`naver ${code} HTTP ${res.status}`);
+  const data = await res.json();
+  const d = data?.datas?.[0];
+  if (!d) throw new Error(`naver ${code} empty`);
+  return {
+    name: d.stockName,
+    price: Number(String(d.closePrice).replace(/,/g, '')),
+  };
+}
+
+function aggregate(items, prices) {
+  const byCode = new Map();
+  for (const h of items) {
+    const cur = byCode.get(h.code) || { code: h.code, quantity: 0, cost: 0 };
+    cur.quantity += h.quantity;
+    cur.cost += h.quantity * h.avgPrice;
+    byCode.set(h.code, cur);
+  }
+  const rows = [...byCode.values()].map((agg) => {
+    const p = prices.get(agg.code) || {};
+    const currentPrice = p.price ?? 0;
+    const avgPrice = agg.cost / agg.quantity;
+    const marketValue = currentPrice * agg.quantity;
+    const profitLoss = marketValue - agg.cost;
+    return {
+      name: p.name || `(${agg.code})`,
+      quantity: agg.quantity,
+      avgPrice,
+      currentPrice,
+      marketValue,
+      profitLoss,
+      cost: agg.cost,
+    };
+  });
+  const totals = rows.reduce(
+    (acc, r) => {
+      acc.cost += r.cost;
+      acc.marketValue += r.marketValue;
+      acc.profitLoss += r.profitLoss;
+      return acc;
+    },
+    { cost: 0, marketValue: 0, profitLoss: 0 }
+  );
+  return { rows, totals };
+}
+
+function renderTable(rows, totals, headerLabel) {
+  const headers = ['종목', '수량', '평단', '현재가', '평가금액', '손익', '%'];
+  const aligns = ['left', 'right', 'right', 'right', 'right', 'right', 'right'];
+  const body = rows.map((r) => {
+    const rate = r.cost > 0 ? (r.profitLoss / r.cost) * 100 : 0;
+    return [
+      r.name,
+      fmtInt(r.quantity),
+      fmtPrice(r.avgPrice),
+      fmtInt(r.currentPrice),
+      fmtInt(r.marketValue),
+      (r.profitLoss >= 0 ? '+' : '') + fmtInt(r.profitLoss),
+      (rate >= 0 ? '+' : '') + rate.toFixed(2),
+    ];
+  });
+  const totalRate = totals.cost > 0 ? (totals.profitLoss / totals.cost) * 100 : 0;
+  const totalRow = [
+    headerLabel,
+    '',
+    '',
+    '',
+    fmtInt(totals.marketValue),
+    (totals.profitLoss >= 0 ? '+' : '') + fmtInt(totals.profitLoss),
+    (totalRate >= 0 ? '+' : '') + totalRate.toFixed(2),
+  ];
+
+  const all = [headers, ...body, totalRow];
+  const widths = headers.map((_, i) => Math.max(...all.map((r) => strWidth(r[i]))));
+  const fmtRow = (r) => r.map((cell, i) => pad(cell, widths[i], aligns[i])).join('  ');
+  const sep = '─'.repeat(widths.reduce((a, b) => a + b, 0) + (widths.length - 1) * 2);
+  return [fmtRow(headers), sep, ...body.map(fmtRow), sep, fmtRow(totalRow)].join('\n');
+}
+
+app.get('/api/assets', async (req, res) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (!ASSETS_TOKEN || token !== ASSETS_TOKEN) {
+    return res.status(401).type('text/plain').send('unauthorized');
+  }
+
+  const uniqueCodes = [...new Set(HOLDINGS.map((h) => h.code))];
+  const fetched = await Promise.all(
+    uniqueCodes.map((c) => fetchPrice(c).then((p) => [c, p]).catch((err) => [c, { error: err.message }]))
+  );
+  const prices = new Map(fetched);
+
+  const accountOrder = [];
+  const byAccount = new Map();
+  for (const h of HOLDINGS) {
+    const acc = h.account || '미분류';
+    if (!byAccount.has(acc)) {
+      accountOrder.push(acc);
+      byAccount.set(acc, []);
+    }
+    byAccount.get(acc).push(h);
+  }
+
+  const sections = [];
+  const overallTotals = { cost: 0, marketValue: 0, profitLoss: 0 };
+  for (const acc of accountOrder) {
+    const { rows, totals } = aggregate(byAccount.get(acc), prices);
+    sections.push(`[${acc}]\n${renderTable(rows, totals, '소계')}`);
+    overallTotals.cost += totals.cost;
+    overallTotals.marketValue += totals.marketValue;
+    overallTotals.profitLoss += totals.profitLoss;
+  }
+
+  const { rows: combinedRows } = aggregate(HOLDINGS, prices);
+  sections.push(`[종목 통합]\n${renderTable(combinedRows, overallTotals, '총합')}`);
+
+  const errors = [];
+  for (const [code, p] of prices) {
+    if (p.error) errors.push(`! ${code}: ${p.error}`);
+  }
+  if (errors.length) sections.push(errors.join('\n'));
+
+  res.type('text/plain').send('```\n' + sections.join('\n\n') + '\n```');
 });
 
 app.listen(PORT, () => console.log('Server running on port ' + PORT));
