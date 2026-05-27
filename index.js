@@ -382,9 +382,9 @@ app.get('/api/assets', async (req, res) => {
     const rate = totalCost > 0 ? (profitLoss / totalCost) * 100 : 0;
     return [
       person.name,
-      `- 총합 : ${fmtInt(totalValue)}원`,
-      `- 손익 : ${(profitLoss >= 0 ? '+' : '') + fmtInt(profitLoss)}원`,
-      `- 비율 : ${(rate >= 0 ? '+' : '') + rate.toFixed(2)}%`,
+      `총합 : ${fmtInt(totalValue)}원`,
+      `손익 : ${(profitLoss >= 0 ? '+' : '') + fmtInt(profitLoss)}원`,
+      `비율 : ${(rate >= 0 ? '+' : '') + rate.toFixed(2)}%`,
     ].join('\n');
   });
 
@@ -392,7 +392,7 @@ app.get('/api/assets', async (req, res) => {
   for (const [code, p] of prices) {
     if (p.error) errors.push(`! ${code}: ${p.error}`);
   }
-  const body = blocks.join('\n\n\n');
+  const body = blocks.join('\n\n');
   res.type('text/plain').send(errors.length ? `${body}\n\n${errors.join('\n')}` : body);
 });
 
