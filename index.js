@@ -423,9 +423,10 @@ function aggregate(items, prices) {
   return { rows, totals };
 }
 
-function renderTable(rows, totals, headerLabel) {
-  const headers = ['종목', '수량', '평단', '현재가', '평가금액', '손익', '%'];
-  const aligns = ['left', 'right', 'right', 'right', 'right', 'right', 'right'];
+const TABLE_HEADERS = ['종목', '수량', '평단', '현재가', '평가금액', '손익', '%'];
+const TABLE_ALIGNS = ['left', 'right', 'right', 'right', 'right', 'right', 'right'];
+
+function rowsForSection(rows, totals, headerLabel) {
   const body = rows.map((r) => {
     const rate = r.cost > 0 ? (r.profitLoss / r.cost) * 100 : 0;
     return [
@@ -448,12 +449,13 @@ function renderTable(rows, totals, headerLabel) {
     (totals.profitLoss >= 0 ? '+' : '') + fmtInt(totals.profitLoss),
     (totalRate >= 0 ? '+' : '') + totalRate.toFixed(2),
   ];
+  return { body, totalRow };
+}
 
-  const all = [headers, ...body, totalRow];
-  const widths = headers.map((_, i) => Math.max(...all.map((r) => strWidth(r[i]))));
-  const fmtRow = (r) => r.map((cell, i) => pad(cell, widths[i], aligns[i])).join('  ');
+function renderSection(body, totalRow, widths) {
+  const fmtRow = (r) => r.map((cell, i) => pad(cell, widths[i], TABLE_ALIGNS[i])).join('  ');
   const sep = '─'.repeat(widths.reduce((a, b) => a + b, 0) + (widths.length - 1) * 2);
-  return [fmtRow(headers), sep, ...body.map(fmtRow), sep, fmtRow(totalRow)].join('\n');
+  return [fmtRow(TABLE_HEADERS), sep, ...body.map(fmtRow), sep, fmtRow(totalRow)].join('\n');
 }
 
 app.get('/api/assets', async (req, res) => {
@@ -480,18 +482,31 @@ app.get('/api/assets', async (req, res) => {
     byAccount.get(acc).push(h);
   }
 
-  const sections = [];
   const overallTotals = { cost: 0, marketValue: 0, profitLoss: 0 };
+  const prepared = [];
   for (const acc of accountOrder) {
     const { rows, totals } = aggregate(byAccount.get(acc), prices);
-    sections.push(`[${acc}]\n${renderTable(rows, totals, '소계')}`);
+    const { body, totalRow } = rowsForSection(rows, totals, '소계');
+    prepared.push({ label: acc, body, totalRow });
     overallTotals.cost += totals.cost;
     overallTotals.marketValue += totals.marketValue;
     overallTotals.profitLoss += totals.profitLoss;
   }
-
   const { rows: combinedRows } = aggregate(HOLDINGS, prices);
-  sections.push(`[종목 통합]\n${renderTable(combinedRows, overallTotals, '총합')}`);
+  const combined = rowsForSection(combinedRows, overallTotals, '총합');
+  prepared.push({ label: '종목 통합', body: combined.body, totalRow: combined.totalRow });
+
+  const allRows = [
+    TABLE_HEADERS,
+    ...prepared.flatMap((s) => [...s.body, s.totalRow]),
+  ];
+  const widths = TABLE_HEADERS.map((_, i) =>
+    Math.max(...allRows.map((r) => strWidth(r[i])))
+  );
+
+  const sections = prepared.map(
+    (s) => `[${s.label}]\n${renderSection(s.body, s.totalRow, widths)}`
+  );
 
   const errors = [];
   for (const [code, p] of prices) {
