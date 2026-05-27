@@ -392,7 +392,7 @@ app.get('/api/assets', async (req, res) => {
   for (const [code, p] of prices) {
     if (p.error) errors.push(`! ${code}: ${p.error}`);
   }
-  const body = blocks.join('\n\n');
+  const body = blocks.join('\n\n\n');
   res.type('text/plain').send(errors.length ? `${body}\n\n${errors.join('\n')}` : body);
 });
 
