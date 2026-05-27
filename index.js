@@ -4,9 +4,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const ASSETS_TOKEN = process.env.ASSETS_TOKEN || '';
-let HOLDINGS = [];
+let PEOPLE = [];
 try {
-  HOLDINGS = JSON.parse(process.env.ACCOUNTS_JSON || '{"holdings":[]}').holdings || [];
+  PEOPLE = JSON.parse(process.env.ACCOUNTS_JSON || '{"people":[]}').people || [];
 } catch (err) {
   console.error('ACCOUNTS_JSON parse failed:', err.message);
 }
@@ -358,7 +358,9 @@ app.get('/api/assets', async (req, res) => {
     return res.status(401).type('text/plain').send('unauthorized');
   }
 
-  const uniqueCodes = [...new Set(HOLDINGS.map((h) => h.code))];
+  const uniqueCodes = [
+    ...new Set(PEOPLE.flatMap((p) => (p.holdings || []).map((h) => h.code))),
+  ];
   const fetched = await Promise.all(
     uniqueCodes.map((c) =>
       fetchPrice(c)
@@ -368,26 +370,30 @@ app.get('/api/assets', async (req, res) => {
   );
   const prices = new Map(fetched);
 
-  let totalCost = 0;
-  let totalValue = 0;
-  for (const h of HOLDINGS) {
-    const p = prices.get(h.code) || {};
-    totalCost += h.quantity * h.avgPrice;
-    totalValue += h.quantity * (p.price ?? 0);
-  }
-  const profitLoss = totalValue - totalCost;
-  const rate = totalCost > 0 ? (profitLoss / totalCost) * 100 : 0;
+  const blocks = PEOPLE.map((person) => {
+    let totalCost = 0;
+    let totalValue = 0;
+    for (const h of person.holdings || []) {
+      const p = prices.get(h.code) || {};
+      totalCost += h.quantity * h.avgPrice;
+      totalValue += h.quantity * (p.price ?? 0);
+    }
+    const profitLoss = totalValue - totalCost;
+    const rate = totalCost > 0 ? (profitLoss / totalCost) * 100 : 0;
+    return [
+      person.name,
+      `  총합 : ${fmtInt(totalValue)}원`,
+      `  손익 : ${(profitLoss >= 0 ? '+' : '') + fmtInt(profitLoss)}원`,
+      `  비율 : ${(rate >= 0 ? '+' : '') + rate.toFixed(2)}%`,
+    ].join('\n');
+  });
 
-  const lines = [
-    `총합 : ${fmtInt(totalValue)}원`,
-    `손익 : ${(profitLoss >= 0 ? '+' : '') + fmtInt(profitLoss)}원`,
-    `비율 : ${(rate >= 0 ? '+' : '') + rate.toFixed(2)}%`,
-  ];
+  const errors = [];
   for (const [code, p] of prices) {
-    if (p.error) lines.push(`! ${code}: ${p.error}`);
+    if (p.error) errors.push(`! ${code}: ${p.error}`);
   }
-
-  res.type('text/plain').send(lines.join('\n'));
+  const body = blocks.join('\n\n');
+  res.type('text/plain').send(errors.length ? `${body}\n\n${errors.join('\n')}` : body);
 });
 
 app.listen(PORT, () => console.log('Server running on port ' + PORT));
