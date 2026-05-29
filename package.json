@@ -1,1 +1,1 @@
-{ "name":"friend-app","version":"1.0.0","main":"index.js","scripts":{"start":"node index.js"},"dependencies":{"express":"^4.18.2"} }
+{ "name":"friend-app","version":"1.0.0","main":"index.js","scripts":{"start":"node index.js"},"dependencies":{"express":"^4.18.2","redis":"^4.7.0"} }

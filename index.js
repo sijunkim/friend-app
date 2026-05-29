@@ -1,5 +1,6 @@
 const express = require('express');
 const path = require('path');
+const { createClient } = require('redis');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -10,6 +11,16 @@ try {
 } catch (err) {
   console.error('ACCOUNTS_JSON parse failed:', err.message);
 }
+
+const REDIS_HOST = process.env.REDIS_HOST || 'redis';
+const REDIS_PORT = process.env.REDIS_PORT || '6379';
+const REDIS_PASSWORD = process.env.REDIS_PASSWORD || '';
+const redis = createClient({
+  url: `redis://default:${encodeURIComponent(REDIS_PASSWORD)}@${REDIS_HOST}:${REDIS_PORT}`,
+  socket: { reconnectStrategy: (retries) => Math.min(retries * 500, 5000) },
+});
+redis.on('error', (err) => console.error('redis error:', err.message));
+redis.connect().catch((err) => console.error('redis connect failed:', err.message));
 
 app.use(express.static(path.join(__dirname)));
 
@@ -341,6 +352,13 @@ function fmtInt(n) {
   return Math.round(n).toLocaleString('ko-KR');
 }
 
+function kstDate(offsetDays = 0) {
+  const d = new Date(Date.now() + offsetDays * 86400000);
+  return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
+}
+
+const SNAPSHOT_KEY_PREFIX = 'friend-app:snapshot:';
+
 async function fetchPrice(code) {
   const url = `https://polling.finance.naver.com/api/realtime/domestic/stock/${code}`;
   const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
@@ -351,13 +369,7 @@ async function fetchPrice(code) {
   return Number(String(d.closePrice).replace(/,/g, ''));
 }
 
-app.get('/api/assets', async (req, res) => {
-  const auth = req.headers.authorization || '';
-  const token = auth.replace(/^Bearer\s+/i, '');
-  if (!ASSETS_TOKEN || token !== ASSETS_TOKEN) {
-    return res.status(401).type('text/plain').send('unauthorized');
-  }
-
+async function computeTotals() {
   const uniqueCodes = [
     ...new Set(PEOPLE.flatMap((p) => (p.holdings || []).map((h) => h.code))),
   ];
@@ -369,6 +381,47 @@ app.get('/api/assets', async (req, res) => {
     )
   );
   const prices = new Map(fetched);
+  const totals = {};
+  for (const person of PEOPLE) {
+    let totalValue = 0;
+    for (const h of person.holdings || []) {
+      const p = prices.get(h.code) || {};
+      totalValue += h.quantity * (p.price ?? 0);
+    }
+    totals[person.name] = totalValue;
+  }
+  const errors = [];
+  for (const [code, p] of prices) {
+    if (p.error) errors.push(`! ${code}: ${p.error}`);
+  }
+  return { prices, totals, errors };
+}
+
+async function readSnapshot(date) {
+  if (!redis.isReady) return null;
+  try {
+    const raw = await redis.get(SNAPSHOT_KEY_PREFIX + date);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    console.error('redis read failed:', err.message);
+    return null;
+  }
+}
+
+async function writeSnapshot(date, totals) {
+  if (!redis.isReady) throw new Error('redis not connected');
+  await redis.set(SNAPSHOT_KEY_PREFIX + date, JSON.stringify(totals));
+}
+
+app.get('/api/assets', async (req, res) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (!ASSETS_TOKEN || token !== ASSETS_TOKEN) {
+    return res.status(401).type('text/plain').send('unauthorized');
+  }
+
+  const { prices, errors } = await computeTotals();
+  const yesterday = await readSnapshot(kstDate(-1));
 
   const blocks = PEOPLE.map((person) => {
     let totalCost = 0;
@@ -380,20 +433,56 @@ app.get('/api/assets', async (req, res) => {
     }
     const profitLoss = totalValue - totalCost;
     const rate = totalCost > 0 ? (profitLoss / totalCost) * 100 : 0;
+    const prev = yesterday?.[person.name];
+    let totalLine = `총합 : ${fmtInt(totalValue)}원`;
+    if (prev != null) {
+      const diff = totalValue - prev;
+      if (diff > 0) totalLine += `  ( :arrow_up: ${fmtInt(diff)}원 )`;
+      else if (diff < 0) totalLine += `  ( :arrow_down: ${fmtInt(-diff)}원 )`;
+    }
     return [
       person.name,
-      `총합 : ${fmtInt(totalValue)}원`,
+      totalLine,
       `손익 : ${(profitLoss >= 0 ? '+' : '') + fmtInt(profitLoss)}원`,
       `비율 : ${(rate >= 0 ? '+' : '') + rate.toFixed(2)}%`,
     ].join('\n');
   });
 
-  const errors = [];
-  for (const [code, p] of prices) {
-    if (p.error) errors.push(`! ${code}: ${p.error}`);
-  }
   const body = blocks.join('\n\n');
   res.type('text/plain').send(errors.length ? `${body}\n\n${errors.join('\n')}` : body);
+});
+
+app.post('/api/snapshot', async (req, res) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (!ASSETS_TOKEN || token !== ASSETS_TOKEN) {
+    return res.status(401).type('text/plain').send('unauthorized');
+  }
+
+  try {
+    const today = kstDate(0);
+    const { totals, errors } = await computeTotals();
+
+    if (errors.length > 0) {
+      const prev = await readSnapshot(kstDate(-1));
+      if (!prev) {
+        return res
+          .status(503)
+          .type('text/plain')
+          .send(`partial fetch failure and no prior snapshot to fall back to\n${errors.join('\n')}`);
+      }
+      await writeSnapshot(today, prev);
+      return res.type('text/plain').send(
+        `partial fetch failure; copied yesterday snapshot to ${today}\n${errors.join('\n')}`
+      );
+    }
+
+    await writeSnapshot(today, totals);
+    res.type('text/plain').send(`snapshot saved for ${today}\n${JSON.stringify(totals)}`);
+  } catch (err) {
+    console.error('snapshot failed:', err.message);
+    res.status(500).type('text/plain').send(`snapshot failed: ${err.message}`);
+  }
 });
 
 app.listen(PORT, () => console.log('Server running on port ' + PORT));
