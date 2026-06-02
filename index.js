@@ -1,10 +1,13 @@
 const express = require('express');
 const path = require('path');
+const crypto = require('crypto');
 const { createClient } = require('redis');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const ASSETS_TOKEN = process.env.ASSETS_TOKEN || '';
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || '';
+const SLACK_TEAM_ID = process.env.SLACK_TEAM_ID || '';
 let PEOPLE = [];
 try {
   PEOPLE = JSON.parse(process.env.ACCOUNTS_JSON || '{"people":[]}').people || [];
@@ -413,13 +416,7 @@ async function writeSnapshot(date, totals) {
   await redis.set(SNAPSHOT_KEY_PREFIX + date, JSON.stringify(totals));
 }
 
-app.get('/api/assets', async (req, res) => {
-  const auth = req.headers.authorization || '';
-  const token = auth.replace(/^Bearer\s+/i, '');
-  if (!ASSETS_TOKEN || token !== ASSETS_TOKEN) {
-    return res.status(401).type('text/plain').send('unauthorized');
-  }
-
+async function buildAssetsBody() {
   const { prices, errors } = await computeTotals();
   const yesterday = await readSnapshot(kstDate(-1));
 
@@ -449,8 +446,51 @@ app.get('/api/assets', async (req, res) => {
   });
 
   const body = blocks.join('\n\n');
-  res.type('text/plain').send(errors.length ? `${body}\n\n${errors.join('\n')}` : body);
+  return errors.length ? `${body}\n\n${errors.join('\n')}` : body;
+}
+
+function verifySlackSignature(rawBody, ts, sig) {
+  if (!ts || !sig || !SLACK_SIGNING_SECRET) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const base = `v0:${ts}:${rawBody}`;
+  const computed = 'v0=' + crypto.createHmac('sha256', SLACK_SIGNING_SECRET).update(base).digest('hex');
+  if (computed.length !== sig.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(computed));
+}
+
+app.get('/api/assets', async (req, res) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (!ASSETS_TOKEN || token !== ASSETS_TOKEN) {
+    return res.status(401).type('text/plain').send('unauthorized');
+  }
+  const body = await buildAssetsBody();
+  res.type('text/plain').send(body);
 });
+
+app.post(
+  '/api/slack-assets',
+  express.raw({ type: '*/*' }),
+  async (req, res) => {
+    const rawBody = req.body?.toString('utf8') || '';
+    const ts = req.headers['x-slack-request-timestamp'];
+    const sig = req.headers['x-slack-signature'];
+    if (!verifySlackSignature(rawBody, ts, sig)) {
+      return res.status(401).type('text/plain').send('unauthorized');
+    }
+    const params = new URLSearchParams(rawBody);
+    if (SLACK_TEAM_ID && params.get('team_id') !== SLACK_TEAM_ID) {
+      return res.status(403).type('text/plain').send('forbidden');
+    }
+    try {
+      const text = await buildAssetsBody();
+      res.json({ response_type: 'ephemeral', text });
+    } catch (err) {
+      console.error('slack-assets failed:', err.message);
+      res.json({ response_type: 'ephemeral', text: `오류: ${err.message}` });
+    }
+  }
+);
 
 app.post('/api/snapshot', async (req, res) => {
   const auth = req.headers.authorization || '';
