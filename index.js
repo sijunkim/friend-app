@@ -362,28 +362,79 @@ function kstDate(offsetDays = 0) {
 
 const SNAPSHOT_KEY_PREFIX = 'friend-app:snapshot:';
 
-async function fetchPrice(code) {
-  const url = `https://polling.finance.naver.com/api/realtime/domestic/stock/${code}`;
+function isUsTicker(code) {
+  return /^[A-Z]+$/.test(code);
+}
+
+async function fetchNaverPrice(url) {
   const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-  if (!res.ok) throw new Error(`naver ${code} HTTP ${res.status}`);
+  if (!res.ok) return null;
   const data = await res.json();
   const d = data?.datas?.[0];
-  if (!d) throw new Error(`naver ${code} empty`);
-  return Number(String(d.closePrice).replace(/,/g, ''));
+  return d ? Number(String(d.closePrice).replace(/,/g, '')) : null;
+}
+
+async function fetchPrice(code) {
+  if (isUsTicker(code)) {
+    // worldstock endpoint, try base then `.O` (NASDAQ) fallback
+    for (const sym of [code, `${code}.O`]) {
+      const price = await fetchNaverPrice(
+        `https://polling.finance.naver.com/api/realtime/worldstock/stock/${sym}`
+      );
+      if (price != null) return { price, isUs: true };
+    }
+    throw new Error(`naver ${code} not found on worldstock`);
+  }
+  const price = await fetchNaverPrice(
+    `https://polling.finance.naver.com/api/realtime/domestic/stock/${code}`
+  );
+  if (price == null) throw new Error(`naver ${code} empty`);
+  return { price, isUs: false };
+}
+
+async function fetchUsdKrwRate() {
+  const url = 'https://api.stock.naver.com/marketindex/exchange/FX_USDKRW';
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  if (!res.ok) throw new Error(`FX HTTP ${res.status}`);
+  const data = await res.json();
+  const cp = data?.exchangeInfo?.closePrice;
+  if (!cp) throw new Error('FX empty');
+  return Number(String(cp).replace(/,/g, ''));
 }
 
 async function computeTotals() {
   const uniqueCodes = [
     ...new Set(PEOPLE.flatMap((p) => (p.holdings || []).map((h) => h.code))),
   ];
+  const needsFx = uniqueCodes.some(isUsTicker);
+  const fxPromise = needsFx
+    ? fetchUsdKrwRate().catch((err) => ({ error: err.message }))
+    : Promise.resolve(null);
+
   const fetched = await Promise.all(
     uniqueCodes.map((c) =>
       fetchPrice(c)
-        .then((price) => [c, { price }])
+        .then(({ price, isUs }) => [c, { price, isUs }])
         .catch((err) => [c, { error: err.message }])
     )
   );
   const prices = new Map(fetched);
+  const fx = await fxPromise;
+  const fxRate = typeof fx === 'number' ? fx : null;
+  const fxError = fx && fx.error ? fx.error : null;
+
+  // 미국 종목은 KRW로 환산해서 price 필드를 KRW로 통일
+  for (const [, p] of prices) {
+    if (p.isUs && p.price != null) {
+      if (fxRate == null) {
+        p.error = `FX rate unavailable${fxError ? `: ${fxError}` : ''}`;
+        delete p.price;
+      } else {
+        p.price = p.price * fxRate;
+      }
+    }
+  }
+
   const totals = {};
   for (const person of PEOPLE) {
     let totalValue = 0;
@@ -397,7 +448,7 @@ async function computeTotals() {
   for (const [code, p] of prices) {
     if (p.error) errors.push(`! ${code}: ${p.error}`);
   }
-  return { prices, totals, errors };
+  return { prices, totals, errors, fxRate };
 }
 
 async function readSnapshot(date) {
