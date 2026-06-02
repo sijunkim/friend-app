@@ -535,10 +535,10 @@ app.post(
     }
     try {
       const text = await buildAssetsBody();
-      res.json({ response_type: 'ephemeral', text });
+      res.json({ response_type: 'in_channel', text });
     } catch (err) {
       console.error('slack-assets failed:', err.message);
-      res.json({ response_type: 'ephemeral', text: `오류: ${err.message}` });
+      res.json({ response_type: 'in_channel', text: `오류: ${err.message}` });
     }
   }
 );
