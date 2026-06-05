@@ -406,7 +406,9 @@ async function computeTotals() {
   const uniqueCodes = [
     ...new Set(PEOPLE.flatMap((p) => (p.holdings || []).map((h) => h.code))),
   ];
-  const needsFx = uniqueCodes.some(isUsTicker);
+  const needsFx =
+    uniqueCodes.some(isUsTicker) ||
+    PEOPLE.some((p) => p.cash && p.cash.usd > 0);
   const fxPromise = needsFx
     ? fetchUsdKrwRate().catch((err) => ({ error: err.message }))
     : Promise.resolve(null);
@@ -437,6 +439,11 @@ async function computeTotals() {
 
   const totals = {};
   for (const person of PEOPLE) {
+    if (person.cash) {
+      const { krw = 0, usd = 0 } = person.cash;
+      totals[person.name] = krw + (fxRate != null ? usd * fxRate : 0);
+      continue;
+    }
     let totalValue = 0;
     for (const h of person.holdings || []) {
       const p = prices.get(h.code) || {};
@@ -447,6 +454,9 @@ async function computeTotals() {
   const errors = [];
   for (const [code, p] of prices) {
     if (p.error) errors.push(`! ${code}: ${p.error}`);
+  }
+  if (fxRate == null && PEOPLE.some((p) => p.cash && p.cash.usd > 0)) {
+    errors.push(`! 환율: ${fxError || 'unavailable'}`);
   }
   return { prices, totals, errors, fxRate };
 }
@@ -467,11 +477,49 @@ async function writeSnapshot(date, totals) {
   await redis.set(SNAPSHOT_KEY_PREFIX + date, JSON.stringify(totals));
 }
 
+function fmtUsd(n) {
+  return n.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+// 현금 보유 계좌(예: 지은이)는 주식 평가 대신 원화/달러 잔액과
+// 달러 환차익(기준환율 usdAvgRate 대비 현재 환율)을 표시한다.
+function buildCashBlock(person, fxRate) {
+  const { krw = 0, usd = 0, usdAvgRate = 0 } = person.cash || {};
+  const lines = [person.name, `원화 : ${fmtInt(krw)}원`];
+
+  let fxGain = 0;
+  if (usd > 0 && fxRate != null) {
+    fxGain = usd * (fxRate - usdAvgRate);
+    let dollarLine = `달러 : $${fmtUsd(usd)}  (${fmtInt(usd * fxRate)}원`;
+    if (fxGain > 0) dollarLine += `, :arrow_up: +${fmtInt(fxGain)}원`;
+    else if (fxGain < 0) dollarLine += `, :arrow_down: ${fmtInt(fxGain)}원`;
+    lines.push(dollarLine + ')');
+  } else if (usd > 0) {
+    lines.push(`달러 : $${fmtUsd(usd)}  (환율 조회 실패)`);
+  } else {
+    lines.push('달러 : $0.00');
+  }
+
+  // 손익 = 달러 환차익만 (원화 현금은 손익 0)
+  // 비율 = 달러 상승률 (기준환율 usdAvgRate 대비 현재 환율이 오른 비율)
+  const rate =
+    usd > 0 && fxRate != null && usdAvgRate > 0
+      ? ((fxRate - usdAvgRate) / usdAvgRate) * 100
+      : 0;
+  lines.push(`손익 : ${(fxGain >= 0 ? '+' : '') + fmtInt(fxGain)}원`);
+  lines.push(`비율 : ${(rate >= 0 ? '+' : '') + rate.toFixed(2)}%`);
+  return lines.join('\n');
+}
+
 async function buildAssetsBody() {
-  const { prices, errors } = await computeTotals();
+  const { prices, errors, fxRate } = await computeTotals();
   const yesterday = await readSnapshot(kstDate(-1));
 
   const blocks = PEOPLE.map((person) => {
+    if (person.cash) return buildCashBlock(person, fxRate);
     let totalCost = 0;
     let totalValue = 0;
     for (const h of person.holdings || []) {
