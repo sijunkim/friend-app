@@ -1,6 +1,6 @@
-// friend-app/index.js — CUTOVER-CLEANED PROPOSAL (NOT applied to live app).
-// 자산 코드(엔드포인트/함수/redis/ACCOUNTS_JSON/slack 서명) 전부 제거. '/' 가족 페이지 + static 만 유지.
-// asset-app 이 모든 자산 기능을 대체한 뒤 컷오버 단계에서 이 내용으로 교체한다.
+// friend-app/index.js — 가족 소개 페이지(friend.kimsijun.com).
+// '/' 가족 페이지 + static 정적 파일만 서빙한다.
+// 자산 기능은 asset-app(asset.kimsijun.com)으로 이관 완료됨.
 const express = require('express');
 const path = require('path');
 const app = express();
